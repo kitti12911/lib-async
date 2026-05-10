@@ -6,12 +6,18 @@ import (
 
 	"github.com/ThreeDotsLabs/watermill"
 	"github.com/ThreeDotsLabs/watermill/message"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type Bus struct {
 	publisher  message.Publisher
 	subscriber message.Subscriber
 	codec      Codec
+	propagator propagation.TextMapPropagator
+	tracer     trace.Tracer
 }
 
 type Envelope[T any] struct {
@@ -30,9 +36,7 @@ type consumeOptions struct {
 }
 
 func NewBus(publisher message.Publisher, subscriber message.Subscriber, opts ...Option) *Bus {
-	cfgOptions := options{
-		codec: JSONCodec{},
-	}
+	cfgOptions := defaultOptions()
 	for _, opt := range opts {
 		opt(&cfgOptions)
 	}
@@ -41,30 +45,37 @@ func NewBus(publisher message.Publisher, subscriber message.Subscriber, opts ...
 		publisher:  publisher,
 		subscriber: subscriber,
 		codec:      cfgOptions.codec,
+		propagator: cfgOptions.propagator,
+		tracer:     cfgOptions.tracer,
 	}
 }
 
 func (b *Bus) Publish(ctx context.Context, topic string, payload any, metadata ...map[string]string) error {
+	ctx, span := startSpan(ctx, b.tracer, "async publish "+topic, trace.SpanKindProducer, topic, "")
+	defer span.End()
+
 	select {
 	case <-ctx.Done():
-		return fmt.Errorf("async: publish context: %w", ctx.Err())
+		return spanError(span, fmt.Errorf("async: publish context: %w", ctx.Err()))
 	default:
 	}
 
 	data, err := b.codec.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("async: marshal publish payload: %w", err)
+		return spanError(span, fmt.Errorf("async: marshal publish payload: %w", err))
 	}
 
-	msg := message.NewMessage(watermill.NewUUID(), data)
+	msg := message.NewMessageWithContext(ctx, watermill.NewUUID(), data)
 	for _, values := range metadata {
 		for key, value := range values {
 			msg.Metadata.Set(key, value)
 		}
 	}
+	b.propagator.Inject(ctx, propagation.MapCarrier(msg.Metadata))
+	span.SetAttributes(attribute.String("messaging.message.id", msg.UUID))
 
 	if err := b.publisher.Publish(topic, msg); err != nil {
-		return fmt.Errorf("async: publish %q: %w", topic, err)
+		return spanError(span, fmt.Errorf("async: publish %q: %w", topic, err))
 	}
 
 	return nil
@@ -79,7 +90,7 @@ func (b *Bus) Subscriber() message.Subscriber {
 }
 
 func (b *Bus) Consume(ctx context.Context, topic string, handler Handler[[]byte], opts ...ConsumeOption) error {
-	return Consume(ctx, b.subscriber, b.codec, topic, handler, opts...)
+	return consume(ctx, b.subscriber, b.codec, b.propagator, b.tracer, topic, handler, opts...)
 }
 
 func (b *Bus) Close() error {
@@ -116,6 +127,24 @@ func Consume[T any](
 	handler Handler[T],
 	opts ...ConsumeOption,
 ) error {
+	cfgOptions := defaultOptions()
+	if codec != nil {
+		cfgOptions.codec = codec
+	}
+
+	return consume(ctx, subscriber, cfgOptions.codec, cfgOptions.propagator, cfgOptions.tracer, topic, handler, opts...)
+}
+
+func consume[T any](
+	ctx context.Context,
+	subscriber message.Subscriber,
+	codec Codec,
+	propagator propagation.TextMapPropagator,
+	tracer trace.Tracer,
+	topic string,
+	handler Handler[T],
+	opts ...ConsumeOption,
+) error {
 	cfgOptions := consumeOptions{}
 	for _, opt := range opts {
 		opt(&cfgOptions)
@@ -126,10 +155,6 @@ func Consume[T any](
 		return fmt.Errorf("async: subscribe %q: %w", topic, err)
 	}
 
-	if codec == nil {
-		codec = JSONCodec{}
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -138,17 +163,22 @@ func Consume[T any](
 			if !ok {
 				return nil
 			}
-			if err := handleMessage(ctx, codec, msg, handler); err != nil {
+			msgCtx := propagator.Extract(ctx, propagation.MapCarrier(msg.Metadata))
+			msgCtx, span := startSpan(msgCtx, tracer, "async consume "+topic, trace.SpanKindConsumer, topic, msg.UUID)
+			if err := handleMessage(msgCtx, codec, msg, handler); err != nil {
+				err = spanError(span, err)
 				if cfgOptions.errorHandler != nil {
-					cfgOptions.errorHandler(ctx, rawEnvelope(msg), err)
+					cfgOptions.errorHandler(msgCtx, rawEnvelope(msg), err)
 				}
 				msg.Nack()
+				span.End()
 				if cfgOptions.stopOnError {
 					return err
 				}
 				continue
 			}
 			msg.Ack()
+			span.End()
 		}
 	}
 }
@@ -193,4 +223,27 @@ func rawEnvelope(msg *message.Message) Envelope[[]byte] {
 		Metadata: msg.Metadata,
 		Payload:  msg.Payload,
 	}
+}
+
+func startSpan(
+	ctx context.Context,
+	tracer trace.Tracer,
+	name string,
+	kind trace.SpanKind,
+	topic string,
+	messageID string,
+) (context.Context, trace.Span) {
+	attrs := []attribute.KeyValue{
+		attribute.String("messaging.destination.name", topic),
+	}
+	if messageID != "" {
+		attrs = append(attrs, attribute.String("messaging.message.id", messageID))
+	}
+	return tracer.Start(ctx, name, trace.WithSpanKind(kind), trace.WithAttributes(attrs...))
+}
+
+func spanError(span trace.Span, err error) error {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+	return err
 }

@@ -48,9 +48,7 @@ func NewNATS(cfg NATSConfig, logger watermill.LoggerAdapter, opts ...Option) (*B
 		logger = watermill.NopLogger{}
 	}
 
-	cfgOptions := options{
-		codec: JSONCodec{},
-	}
+	cfgOptions := defaultOptions()
 	for _, opt := range opts {
 		opt(&cfgOptions)
 	}
@@ -92,5 +90,11 @@ func NewNATS(cfg NATSConfig, logger watermill.LoggerAdapter, opts ...Option) (*B
 		return nil, fmt.Errorf("async: create nats subscriber: %w", err)
 	}
 
-	return NewBus(publisher, subscriber, WithCodec(cfgOptions.codec)), nil
+	return NewBus(
+		publisher,
+		subscriber,
+		WithCodec(cfgOptions.codec),
+		WithPropagator(cfgOptions.propagator),
+		WithTracer(cfgOptions.tracer),
+	), nil
 }

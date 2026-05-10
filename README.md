@@ -65,6 +65,17 @@ err = async.Consume(ctx, bus.Subscriber(), async.JSONCodec{}, "jobs.pdf", func(c
 })
 ```
 
+## tracing
+
+`Publish` starts a producer span and injects W3C trace context into message
+metadata. `Consume` extracts that metadata, starts a consumer span, and passes
+the connected context into the handler.
+
+By default the library uses the OpenTelemetry tracer named
+`github.com/kitti12911/lib-async` and the W3C Trace Context propagator. Services
+can override those with `async.WithTracer(...)` and
+`async.WithPropagator(...)`.
+
 ## delivery modes
 
 - Core NATS is useful for fire-and-forget events. Ack calls are effectively

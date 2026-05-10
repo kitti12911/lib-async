@@ -10,6 +10,10 @@ import (
 	watermillnats "github.com/ThreeDotsLabs/watermill-nats/v2/pkg/nats"
 	"github.com/ThreeDotsLabs/watermill/message"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type job struct {
@@ -27,6 +31,30 @@ func TestPublishEncodesPayloadAndMetadata(t *testing.T) {
 	require.Len(t, publisher.messages, 1)
 	require.JSONEq(t, `{"id":"j1"}`, string(publisher.messages[0].Payload))
 	require.Equal(t, "test", publisher.messages[0].Metadata.Get("source"))
+}
+
+func TestPublishInjectsTraceContext(t *testing.T) {
+	t.Parallel()
+
+	tracer, recorder := newTestTracing()
+	propagator := propagation.TraceContext{}
+	ctx, parent := tracer.Start(context.Background(), "request")
+	parentContext := parent.SpanContext()
+
+	publisher := &testPublisher{}
+	bus := NewBus(publisher, nil, WithTracer(tracer), WithPropagator(propagator))
+	err := bus.Publish(ctx, "jobs.pdf", job{ID: "j1"})
+	parent.End()
+
+	require.NoError(t, err)
+	require.Len(t, publisher.messages, 1)
+	require.NotEmpty(t, publisher.messages[0].Metadata.Get("traceparent"))
+
+	publishSpan := requireEndedSpan(t, recorder, "async publish jobs.pdf")
+	require.Equal(t, trace.SpanKindProducer, publishSpan.SpanKind())
+	require.Equal(t, parentContext.TraceID(), publishSpan.SpanContext().TraceID())
+	require.Equal(t, parentContext.SpanID(), publishSpan.Parent().SpanID())
+	require.Equal(t, publishSpan.SpanContext().SpanID(), trace.SpanContextFromContext(publisher.messages[0].Context()).SpanID())
 }
 
 func TestPublishReturnsContextError(t *testing.T) {
@@ -94,6 +122,48 @@ func TestConsumeAcksHandledMessages(t *testing.T) {
 	})
 	require.NoError(t, err)
 	requireAcked(t, msg)
+}
+
+func TestConsumeExtractsTraceContext(t *testing.T) {
+	t.Parallel()
+
+	tracer, recorder := newTestTracing()
+	propagator := propagation.TraceContext{}
+	traceID := requireTraceID(t, "01020304050607080900010203040506")
+	spanID := requireSpanID(t, "0102030405060708")
+	remoteParent := trace.NewSpanContext(trace.SpanContextConfig{
+		TraceID:    traceID,
+		SpanID:     spanID,
+		TraceFlags: trace.FlagsSampled,
+		Remote:     true,
+	})
+	carrier := propagation.MapCarrier{}
+	propagator.Inject(trace.ContextWithRemoteSpanContext(context.Background(), remoteParent), carrier)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	msg := message.NewMessage("m1", []byte(`"eyJpZCI6ImoxIn0="`))
+	for key, value := range carrier {
+		msg.Metadata.Set(key, value)
+	}
+
+	var handlerSpan trace.SpanContext
+	bus := NewBus(nil, newTestSubscriber(msg), WithTracer(tracer), WithPropagator(propagator))
+	err := bus.Consume(ctx, "jobs.pdf", func(ctx context.Context, envelope Envelope[[]byte]) error {
+		handlerSpan = trace.SpanContextFromContext(ctx)
+		require.Equal(t, []byte(`{"id":"j1"}`), envelope.Payload)
+		cancel()
+		return nil
+	})
+	require.NoError(t, err)
+	requireAcked(t, msg)
+
+	consumeSpan := requireEndedSpan(t, recorder, "async consume jobs.pdf")
+	require.Equal(t, trace.SpanKindConsumer, consumeSpan.SpanKind())
+	require.Equal(t, remoteParent.TraceID(), consumeSpan.SpanContext().TraceID())
+	require.Equal(t, remoteParent.SpanID(), consumeSpan.Parent().SpanID())
+	require.Equal(t, consumeSpan.SpanContext().SpanID(), handlerSpan.SpanID())
 }
 
 func TestConsumeDefaultsCodecAndReturnsWhenContextIsCanceled(t *testing.T) {
@@ -348,6 +418,19 @@ func TestNATSFactoryResultsReturnSuccessfulAdapters(t *testing.T) {
 	require.Same(t, subscriber, gotSubscriber)
 }
 
+func TestOptionsIgnoreNilValues(t *testing.T) {
+	t.Parallel()
+
+	defaults := defaultOptions()
+	WithCodec(nil)(&defaults)
+	WithPropagator(nil)(&defaults)
+	WithTracer(nil)(&defaults)
+
+	require.IsType(t, JSONCodec{}, defaults.codec)
+	require.NotNil(t, defaults.propagator)
+	require.NotNil(t, defaults.tracer)
+}
+
 type testPublisher struct {
 	messages   []*message.Message
 	publishErr error
@@ -425,6 +508,40 @@ func restoreNATSFactories(t *testing.T) {
 		newNATSPublisher = originalPublisher
 		newNATSSubscriber = originalSubscriber
 	})
+}
+
+func newTestTracing() (trace.Tracer, *tracetest.SpanRecorder) {
+	recorder := tracetest.NewSpanRecorder()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder))
+	return provider.Tracer(instrumentationName), recorder
+}
+
+func requireEndedSpan(t *testing.T, recorder *tracetest.SpanRecorder, name string) sdktrace.ReadOnlySpan {
+	t.Helper()
+
+	for _, span := range recorder.Ended() {
+		if span.Name() == name {
+			return span
+		}
+	}
+	t.Fatalf("span %q was not ended", name)
+	return nil
+}
+
+func requireTraceID(t *testing.T, id string) trace.TraceID {
+	t.Helper()
+
+	traceID, err := trace.TraceIDFromHex(id)
+	require.NoError(t, err)
+	return traceID
+}
+
+func requireSpanID(t *testing.T, id string) trace.SpanID {
+	t.Helper()
+
+	spanID, err := trace.SpanIDFromHex(id)
+	require.NoError(t, err)
+	return spanID
 }
 
 func requireAcked(t *testing.T, msg *message.Message) {
