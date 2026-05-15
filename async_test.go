@@ -247,6 +247,63 @@ func TestConsumeNacksHandlerErrors(t *testing.T) {
 	requireNacked(t, msg)
 }
 
+func TestConsumeRecoversFromHandlerPanic(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	msg := message.NewMessage("m1", []byte(`{"id":"j1"}`))
+	subscriber := newTestSubscriber(msg)
+
+	var capturedErr error
+	err := Consume(
+		ctx,
+		subscriber,
+		JSONCodec{},
+		"jobs.pdf",
+		func(context.Context, Envelope[job]) error {
+			panic("boom")
+		},
+		WithStopOnError(true),
+		WithErrorHandler(func(_ context.Context, _ Envelope[[]byte], err error) {
+			capturedErr = err
+		}),
+	)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "panic: boom")
+	require.ErrorContains(t, capturedErr, "panic: boom")
+	requireNacked(t, msg)
+}
+
+func TestConsumeRecoversFromHandlerPanicAndContinues(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	bad := message.NewMessage("m1", []byte(`{"id":"j1"}`))
+	good := message.NewMessage("m2", []byte(`{"id":"j2"}`))
+	subscriber := newTestSubscriber(bad, good)
+
+	var handled []string
+	err := Consume(
+		ctx,
+		subscriber,
+		JSONCodec{},
+		"jobs.pdf",
+		func(_ context.Context, env Envelope[job]) error {
+			handled = append(handled, env.Payload.ID)
+			if env.Payload.ID == "j1" {
+				panic("boom")
+			}
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []string{"j1", "j2"}, handled)
+	requireNacked(t, bad)
+	requireAcked(t, good)
+}
+
 func TestBusCloseHandlesPublisherAndSubscriber(t *testing.T) {
 	t.Parallel()
 

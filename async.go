@@ -200,11 +200,17 @@ func handleMessage[T any](
 	codec Codec,
 	msg *message.Message,
 	handler Handler[T],
-) error {
+) (retErr error) {
 	var payload T
 	if err := codec.Unmarshal(msg.Payload, &payload); err != nil {
 		return fmt.Errorf("async: unmarshal message %q: %w", msg.UUID, err)
 	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			retErr = fmt.Errorf("async: handle message %q: panic: %v", msg.UUID, r)
+		}
+	}()
 
 	if err := handler(ctx, Envelope[T]{
 		UUID:     msg.UUID,
